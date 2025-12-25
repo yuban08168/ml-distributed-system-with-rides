@@ -1,0 +1,166 @@
+version: '3.8'
+
+services:
+  # Redis服务
+  redis:
+    image: redis:7-alpine
+    container_name: ml-redis
+    command: >
+      redis-server 
+      --appendonly yes 
+      --maxmemory 256mb 
+      --maxmemory-policy allkeys-lru
+      --save 900 1
+      --save 300 10
+      --save 60 10000
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+      - ./redis.conf:/usr/local/etc/redis/redis.conf
+    networks:
+      - ml-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # 任务管理器
+  manager:
+    build: .
+    container_name: ml-manager
+    command: python run.py manager --tasks 10000
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - LOG_LEVEL=INFO
+      - MAX_TASKS=10000
+    networks:
+      - ml-network
+    volumes:
+      - ./results:/app/results
+      - ./logs:/app/logs
+    restart: on-failure
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '1'
+
+  # 工作节点池（可以根据需要扩展）
+  worker:
+    build: .
+    image: ml-worker:latest
+    deploy:
+      replicas: 4
+    command: python run.py worker --worker-id worker-$${HOSTNAME}
+    depends_on:
+      - redis
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - WORKER_ID=worker-$${HOSTNAME}
+      - MEMORY_LIMIT_MB=512
+    networks:
+      - ml-network
+    restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+
+  # 结果收集器
+  collector:
+    build: .
+    container_name: ml-collector
+    command: python run.py collector --max-results 10000
+    depends_on:
+      - redis
+      - manager
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    networks:
+      - ml-network
+    volumes:
+      - ./results:/app/results
+      - ./logs:/app/logs
+    restart: on-failure
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  # Web监控界面（可选）
+  monitor:
+    build: .
+    container_name: ml-monitor
+    command: python monitor/monitor.py
+    depends_on:
+      - redis
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    ports:
+      - "8080:8080"
+    networks:
+      - ml-network
+    volumes:
+      - ./logs:/app/logs
+    restart: unless-stopped
+
+  # Prometheus监控（可选，高级）
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: ml-prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    ports:
+      - "9090:9090"
+    networks:
+      - ml-network
+    restart: unless-stopped
+
+  # Grafana仪表板（可选，高级）
+  grafana:
+    image: grafana/grafana:latest
+    container_name: ml-grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    ports:
+      - "3000:3000"
+    networks:
+      - ml-network
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+
+networks:
+  ml-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16

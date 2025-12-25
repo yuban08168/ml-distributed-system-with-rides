@@ -1,0 +1,67 @@
+# 忽略文件
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# 忽略日志和缓存
+*.log
+*.sqlite3
+*.db
+
+# 忽略环境文件
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# 忽略IDE文件
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 忽略操作系统文件
+.DS_Store
+Thumbs.db
+
+# 忽略数据文件（但保留目录结构）
+data/*
+!data/.gitkeep
+
+# 忽略结果文件（但保留目录结构）
+results/*
+!results/.gitkeep
+
+# 忽略日志文件（但保留目录结构）
+logs/*
+!logs/.gitkeep
+
+# 测试文件
+test/
+tests/
+.tox/
+.coverage
+htmlcov/
+.pytest_cache/
