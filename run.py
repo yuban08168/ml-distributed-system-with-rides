@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-分布式机器学习任务调度系统 - Docker版本
+分布式机器学习任务调度系统
 """
 import os
 import sys
@@ -94,7 +94,7 @@ def start_monitor(args):
     monitor.monitor(args.interval)
 
 def start_all(args):
-    """启动所有组件（在一个容器中，用于开发测试）"""
+    """启动所有组件（本地多进程开发测试）"""
     print("=" * 60)
     print("🚀 启动分布式机器学习任务调度系统")
     print("=" * 60)
@@ -137,7 +137,7 @@ def start_all(args):
     for i in range(args.workers):
         worker_proc = multiprocessing.Process(
             target=start_worker,
-            args=(argparse.Namespace(worker_id=f"worker-docker-{i+1}"),)
+            args=(argparse.Namespace(worker_id=f"worker-{i+1}"),)
         )
         worker_proc.start()
         processes.append(worker_proc)
@@ -179,7 +179,7 @@ def start_all(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='分布式机器学习任务调度系统 (Docker版本)',
+        description='分布式机器学习任务调度系统',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 使用示例:

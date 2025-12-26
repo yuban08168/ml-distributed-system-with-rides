@@ -142,7 +142,7 @@ class MLWorker:
         # 定期垃圾回收
         current_time = time.time()
         if current_time - self.last_gc_time > 60:  # 每60秒一次GC
-            gc.collect()
+            # gc.collect()
             self.last_gc_time = current_time
         
         # 检查是否超过内存限制
@@ -267,7 +267,7 @@ class MLWorker:
             
             # 清理内存
             del model, cv_results, mse_scores, mae_scores, r2_scores, rmse_scores
-            gc.collect()
+            #gc.collect()
             
             return result
             
