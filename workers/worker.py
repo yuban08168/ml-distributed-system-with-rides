@@ -247,6 +247,7 @@ class MLWorker:
             # 收集结果
             result = {
                 'task_id': task.get('task_id'),
+                'job_id': task.get('job_id'),
                 'worker_id': self.worker_id,
                 'model_type': model_type,
                 'hyperparameters': hyperparameters,

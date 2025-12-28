@@ -1,63 +1,52 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -e
 
-echo "🚀 分布式机器学习系统 - 一键部署脚本"
-echo "========================================"
+echo "🚀 分布式机器学习系统 - Quick Start (CLI 优先)"
+echo "============================================="
 
-# 1. 克隆项目（如果是新服务器）
-if [ ! -d "ml-docker-system" ]; then
-    echo "📥 下载项目代码..."
-    # 这里假设你已经有代码，实际使用时可以从Git仓库克隆
-    mkdir -p ml-docker-system
-    echo "✅ 项目目录创建完成"
+# 0) 进入项目根目录
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT_DIR"
+
+# 1) Python 虚拟环境与依赖
+if [ ! -d ".venv" ]; then
+    echo "📦 创建虚拟环境 .venv"
+    python -m venv .venv
 fi
+source .venv/bin/activate
+echo "📦 安装依赖"
+pip install -r requirements.txt
+pip install -e .  # 安装生成 ml-ds 命令
 
-cd ml-docker-system
-
-# 2. 创建必要的目录
-echo "📁 创建目录结构..."
-mkdir -p results logs data
-
-# 3. 给脚本执行权限
-chmod +x deploy.sh
-chmod +x run.py
-
-# 4. 构建Docker镜像
-echo "🐳 构建Docker镜像..."
-docker-compose build
-
-# 5. 启动服务
-echo "🚀 启动服务..."
-docker-compose up -d redis
-
-# 等待Redis启动
-echo "⏳ 等待Redis启动..."
-sleep 5
-
-# 检查Redis状态
-if docker-compose exec redis redis-cli ping | grep -q "PONG"; then
-    echo "✅ Redis启动成功"
+# 2) 启动本地 Redis（如已启动可跳过）
+if command -v redis-server >/dev/null 2>&1; then
+    echo "🧩 启动本地 Redis（后台）"
+    if [ -f "redis.conf" ]; then
+        redis-server redis.conf &
+    else
+        redis-server &
+    fi
+    sleep 2
 else
-    echo "❌ Redis启动失败"
-    exit 1
+    echo "⚠️ 未检测到 redis-server，请自行启动或指定 --redis-url"
 fi
 
-# 启动其他服务
-docker-compose up -d manager worker collector
+# 3) 运行一键所有组件（可通过环境变量覆盖）
+TASKS="${TASKS:-100}"
+WORKERS="${WORKERS:-2}"
+MONITOR="${MONITOR:-1}"
 
-# 6. 显示状态
-echo ""
-echo "📊 部署完成！系统状态："
-docker-compose ps
+MONITOR_FLAG=""
+if [ "$MONITOR" = "1" ]; then
+    MONITOR_FLAG="--monitor"
+fi
+
+echo "🚀 启动：ml-ds all --tasks $TASKS -w $WORKERS $MONITOR_FLAG"
+ml-ds all --tasks "$TASKS" -w "$WORKERS" $MONITOR_FLAG
 
 echo ""
-echo "🌐 访问信息："
-echo "  - Redis管理：redis-cli -h localhost -p 6379"
-echo "  - 查看日志：docker-compose logs -f"
-echo "  - 停止服务：docker-compose down"
-echo ""
-echo "📈 扩展工作节点："
-echo "  docker-compose up -d --scale worker=8"
-echo ""
-echo "📁 数据目录："
-echo "  - 结果文件：./results/"
-echo "  - 日志文件：./logs/"
+echo "✅ 已启动所有组件。结果将写入 results/ 下的 CSV 文件。"
+echo "🔧 自定义示例："
+echo "  - TASKS=200 WORKERS=4 MONITOR=1 ./quick-start.sh"
+echo "  - 使用远程 Redis：ml-ds all --redis-url redis://your-host:6379/0 --tasks 100 -w 2 --monitor"
+echo "  - 单独跑 worker：ml-ds worker --redis-url redis://your-host:6379/0 -c 8"

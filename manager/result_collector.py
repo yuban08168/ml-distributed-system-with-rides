@@ -1,21 +1,22 @@
 import json
 import time
 import pandas as pd
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from pathlib import Path
 from utils.redis_client import RedisClient
 from config.settings import RESULTS_DIR
 
 class ResultCollector:
-    """结果收集器（支持增量写入，避免内存溢出）"""
+    """结果收集器（支持增量写入，避免内存溢出，支持按 job_id 过滤统计）"""
     
-    def __init__(self, output_file: str = None):
+    def __init__(self, output_file: str = None, job_id: Optional[str] = None):
         self.redis_client = RedisClient()
         self.output_file = output_file or f"results_{int(time.time())}.csv"
         self.output_path = RESULTS_DIR / self.output_file
         self.results_buffer = []
         self.buffer_size = 100  # 每100条结果写入一次文件
         self.total_collected = 0
+        self.job_id = job_id
         
         # 初始化结果文件
         self._init_output_file()
@@ -26,7 +27,7 @@ class ResultCollector:
             # 创建CSV文件并写入表头
             with open(self.output_path, 'w') as f:
                 f.write(
-                    "timestamp,task_id,worker_id,model_type,hyperparameters,"
+                    "timestamp,job_id,task_id,worker_id,model_type,hyperparameters,"
                     "mean_rmse,std_rmse,mean_mse,std_mse,"
                     "mean_mae,std_mae,mean_r2,std_r2,"
                     "training_time,memory_usage\n"
@@ -50,6 +51,7 @@ class ResultCollector:
                 formatted_rows.append({
                     'timestamp': time.strftime('%Y-%m-%d %H:%M:%S', 
                                              time.localtime(row['completed_at'])),
+                    'job_id': row.get('job_id'),
                     'task_id': row['task_id'],
                     'worker_id': row['worker_id'],
                     'model_type': row['model_type'],
@@ -82,6 +84,7 @@ class ResultCollector:
         try:
             # 提取关键信息
             processed_result = {
+                'job_id': result.get('job_id'),
                 'task_id': result.get('task_id'),
                 'worker_id': result.get('worker_id'),
                 'model_type': result.get('model_type'),
@@ -178,6 +181,10 @@ class ResultCollector:
         try:
             if self.output_path.exists():
                 df = pd.read_csv(self.output_path)
+
+                # 如指定了 job_id，则仅统计该 job 下的结果
+                if self.job_id and 'job_id' in df.columns:
+                    df = df[df['job_id'] == self.job_id]
                 
                 # 基本统计
                 print("\n" + "="*50)

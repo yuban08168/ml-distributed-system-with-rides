@@ -4,13 +4,15 @@ from typing import Optional, Any, Dict, List
 import time
 from contextlib import contextmanager
 import pickle
-from config.settings import REDIS_CONFIG, QUEUE_NAMES
+from config.settings import build_redis_config, QUEUE_NAMES
 
 class RedisClient:
     """Redis连接管理器（内存优化版）"""
     
     def __init__(self):
-        self._connection_pool = redis.ConnectionPool(**REDIS_CONFIG)
+        # 这里每次根据当前环境变量构建配置，
+        # 以便支持通过 CLI 动态注入 Redis 地址等信息。
+        self._connection_pool = redis.ConnectionPool(**build_redis_config())
         self._queues = QUEUE_NAMES
     
     @property

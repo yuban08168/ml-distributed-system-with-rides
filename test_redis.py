@@ -10,7 +10,7 @@ def test_connection():
         response = client.ping()
         if response:
             print("✅ Redis远程连接成功！")
-            # 可选：打印一些服务器信息
+            # 打印一些服务器信息
             info = client.info('server')
             print(f"   Redis版本：{info.get('redis_version')}")
         else:

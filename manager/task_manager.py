@@ -1,7 +1,7 @@
 import json
 import time
 import uuid
-from typing import List, Dict, Any, Generator
+from typing import List, Dict, Any, Generator, Optional, Iterable
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from sklearn.model_selection import ParameterGrid, ParameterSampler
@@ -9,11 +9,18 @@ from utils.redis_client import RedisClient
 from config.settings import TASK_CONFIG
 
 class TaskManager:
-    """任务管理器 - 生成和分发任务"""
+    """任务管理器 - 生成和分发任务
+
+    支持按 job_id 聚合一批任务，可选限制参与的模型类型。
+    """
     
-    def __init__(self):
+    def __init__(self, job_id: Optional[str] = None, model_types: Optional[Iterable[str]] = None):
         self.redis_client = RedisClient()
         self.task_counter = 0
+        # 若未显式指定，则自动生成一个基于时间戳的 job_id
+        self.job_id = job_id or f"job_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+        # 限制参与本轮任务的模型类型，如 ["tree", "forest"]
+        self.model_types = set(model_types) if model_types else None
         
     def generate_hyperparameters_grid(self) -> List[Dict[str, Any]]:
         """生成超参数网格（内存优化：使用生成器）"""
@@ -50,6 +57,9 @@ class TaskManager:
         
         all_params = []
         for model_type, params in param_grid.items():
+            # 如指定了模型筛选列表，则跳过不在列表中的模型
+            if self.model_types and model_type not in self.model_types:
+                continue
             grid = ParameterGrid(params)
             for param_set in grid:
                 # 将 model_type 字段从超参数中剥离，保持任务结构一致
@@ -58,6 +68,7 @@ class TaskManager:
                 # 添加任务ID和其他元数据
                 task = {
                     'task_id': f"task_{self.task_counter}",
+                    'job_id': self.job_id,
                     'model_type': model_type,
                     'hyperparameters': param_set,
                     'created_at': time.time(),
@@ -78,8 +89,15 @@ class TaskManager:
     def generate_hyperparameters_random(self, n_tasks: int = 100000) -> Generator:
         """随机生成超参数（支持大规模任务）"""
         
+        model_types_all = ['linear', 'tree', 'forest', 'gradient']
+        if self.model_types:
+            # 仅保留用户指定的模型类型
+            model_types_all = [m for m in model_types_all if m in self.model_types]
+            if not model_types_all:
+                raise ValueError("model_types 过滤后为空，请检查配置")
+
         param_distributions = {
-            'model_type': ['linear', 'tree', 'forest', 'gradient'],
+            'model_type': model_types_all,
             'max_depth': [3, 5, 7, 10, 15, 20, None],
             'min_samples_split': [2, 5, 10],
             'min_samples_leaf': [1, 2, 4],
@@ -99,6 +117,7 @@ class TaskManager:
             hyperparams = {k: v for k, v in params.items() if k != 'model_type'}
             task = {
                 'task_id': f"task_{i}",
+                'job_id': self.job_id,
                 'model_type': model_type,
                 'hyperparameters': hyperparams,
                 'created_at': time.time(),

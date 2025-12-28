@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ml-distributed-system"
+version = "0.1.0"
+description = "A Redis-based distributed ML task scheduling system"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Proprietary" }
+
+# 依赖仍以 requirements.txt 为准，这里不重复声明第三方库，
+# 以免与教学/实验环境中的 requirements.txt 产生不一致。
+
+authors = [
+  { name = "ML Distributed System" }
+]
+
+[project.scripts]
+# 安装后会生成 `ml-ds` 命令，对应 Typer 应用 `utils.cli.app`
+ml-ds = "utils.cli:app"
+
+[tool.setuptools]
+# 显式指定要打包的 Python 包，避免误把 data/logs/results/虚拟环境等目录当成包
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = [
+  "config",
+  "manager",
+  "monitor",
+  "utils",
+  "workers",
+]
+exclude = [
+  "data",
+  "logs",
+  "results",
+  "distributed",
+  "ml-distributed-system-with-rides",
+]
