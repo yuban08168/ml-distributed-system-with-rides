@@ -1,116 +1,99 @@
 import json
 import time
-import pandas as pd
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, Optional, List
 from pathlib import Path
+
+import pandas as pd
+
 from utils.redis_client import RedisClient
 from config.settings import RESULTS_DIR
 
+
 class ResultCollector:
-    """结果收集器（支持增量写入，避免内存溢出，支持按 job_id 过滤统计）"""
-    
+    """通用结果收集器。
+
+    不再假设结果结构中一定存在特定的机器学习指标字段，而是：
+    - 将从 Redis 结果队列中取出的字典原样缓存在内存中；
+    - 定期使用 pandas.json_normalize 动态展开为表格并追加到 CSV；
+    - 至少保证 job_id / task_id / worker_id / completed_at 等通用字段
+      若存在会被一起写入，其他业务字段完全由用户自定义。
+    """
+
     def __init__(self, output_file: str = None, job_id: Optional[str] = None):
         self.redis_client = RedisClient()
         self.output_file = output_file or f"results_{int(time.time())}.csv"
         self.output_path = RESULTS_DIR / self.output_file
-        self.results_buffer = []
+        self.results_buffer: List[Dict[str, Any]] = []
         self.buffer_size = 100  # 每100条结果写入一次文件
         self.total_collected = 0
         self.job_id = job_id
-        
-        # 初始化结果文件
+
+        # 初始化输出文件（首批写入时再创建表头）
         self._init_output_file()
-    
-    def _init_output_file(self):
-        """初始化输出文件"""
+
+    def _init_output_file(self) -> None:
+        """初始化输出文件（如不存在则创建空文件）。"""
         if not self.output_path.exists():
-            # 创建CSV文件并写入表头
-            with open(self.output_path, 'w') as f:
-                f.write(
-                    "timestamp,job_id,task_id,worker_id,model_type,hyperparameters,"
-                    "mean_rmse,std_rmse,mean_mse,std_mse,"
-                    "mean_mae,std_mae,mean_r2,std_r2,"
-                    "training_time,memory_usage\n"
-                )
-    
-    def _flush_buffer(self):
-        """将缓冲区数据写入文件"""
+            # 创建空文件，占位用；首批 flush 时会写入表头
+            self.output_path.touch()
+
+    def _flush_buffer(self) -> None:
+        """将缓冲区数据写入文件（CSV，动态列）。"""
         if not self.results_buffer:
             return
-        
+
         try:
-            # 转换为DataFrame并追加到文件
-            df = pd.DataFrame(self.results_buffer)
-            
-            # 格式化数据
-            formatted_rows = []
-            for _, row in df.iterrows():
-                # 将超参数转换为字符串
-                hyperparams_str = json.dumps(row['hyperparameters'])
-                
-                formatted_rows.append({
-                    'timestamp': time.strftime('%Y-%m-%d %H:%M:%S', 
-                                             time.localtime(row['completed_at'])),
-                    'job_id': row.get('job_id'),
-                    'task_id': row['task_id'],
-                    'worker_id': row['worker_id'],
-                    'model_type': row['model_type'],
-                    'hyperparameters': hyperparams_str,
-                    'mean_rmse': row['mean_rmse'],
-                    'std_rmse': row['std_rmse'],
-                    'mean_mse': row['mean_mse'],
-                    'std_mse': row['std_mse'],
-                    'mean_mae': row.get('mean_mae', 0),
-                    'std_mae': row.get('std_mae', 0),
-                    'mean_r2': row.get('mean_r2', 0),
-                    'std_r2': row.get('std_r2', 0),
-                    'training_time': row['training_time'],
-                    'memory_usage': row['memory_usage']
-                })
-            
-            # 追加到CSV文件
-            df_formatted = pd.DataFrame(formatted_rows)
-            df_formatted.to_csv(self.output_path, mode='a', 
-                              header=False, index=False)
-            
-            print(f"写入 {len(self.results_buffer)} 条结果到文件，总计 {self.total_collected}")
+            # 可选按 job_id 过滤
+            data = self.results_buffer
+            if self.job_id is not None:
+                data = [r for r in data if r.get("job_id") == self.job_id]
+
+            if not data:
+                self.results_buffer = []
+                return
+
+            # 使用 json_normalize 展开任意嵌套结构
+            df = pd.json_normalize(data)
+
+            # 若存在 completed_at 字段，可派生一个可读时间戳列
+            if "completed_at" in df.columns:
+                df["timestamp"] = df["completed_at"].apply(
+                    lambda ts: time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+                    if pd.notnull(ts)
+                    else ""
+                )
+
+            # 是否需要写表头
+            write_header = not self.output_path.exists() or self.output_path.stat().st_size == 0
+
+            df.to_csv(
+                self.output_path,
+                mode="a",
+                header=write_header,
+                index=False,
+            )
+
+            print(f"写入 {len(data)} 条结果到文件，总计 {self.total_collected}")
             self.results_buffer = []
-            
+
         except Exception as e:
             print(f"写入文件失败: {e}")
-    
-    def process_result(self, result: Dict[str, Any]):
-        """处理单个结果"""
+
+    def process_result(self, result: Dict[str, Any]) -> bool:
+        """处理单个结果（直接缓冲原始字典）。"""
         try:
-            # 提取关键信息
-            processed_result = {
-                'job_id': result.get('job_id'),
-                'task_id': result.get('task_id'),
-                'worker_id': result.get('worker_id'),
-                'model_type': result.get('model_type'),
-                'hyperparameters': result.get('hyperparameters', {}),
-                'completed_at': result.get('completed_at', time.time()),
-                'mean_rmse': result.get('metrics', {}).get('mean_rmse', 0),
-                'std_rmse': result.get('metrics', {}).get('std_rmse', 0),
-                'mean_mse': result.get('metrics', {}).get('mean_mse', 0),
-                'std_mse': result.get('metrics', {}).get('std_mse', 0),
-                    'mean_mae': result.get('metrics', {}).get('mean_mae', 0),
-                    'std_mae': result.get('metrics', {}).get('std_mae', 0),
-                    'mean_r2': result.get('metrics', {}).get('mean_r2', 0),
-                    'std_r2': result.get('metrics', {}).get('std_r2', 0),
-                'training_time': result.get('metrics', {}).get('training_time', 0),
-                'memory_usage': result.get('memory_usage_mb', 0)
-            }
-            
-            self.results_buffer.append(processed_result)
+            if not isinstance(result, dict):
+                raise TypeError("结果必须是字典类型")
+
+            self.results_buffer.append(result)
             self.total_collected += 1
-            
+
             # 如果缓冲区满了，写入文件
             if len(self.results_buffer) >= self.buffer_size:
                 self._flush_buffer()
-                
+
             return True
-            
+
         except Exception as e:
             print(f"处理结果失败: {e}")
             return False
@@ -173,45 +156,5 @@ class ResultCollector:
             
             print(f"收集完成！总共收集 {collected} 个结果")
             
-            # 生成统计报告
-            self.generate_summary()
-    
-    def generate_summary(self):
-        """生成统计报告"""
-        try:
-            if self.output_path.exists():
-                df = pd.read_csv(self.output_path)
+            # 统计报告属于业务层，调度层不再内置特定指标分析逻辑
 
-                # 如指定了 job_id，则仅统计该 job 下的结果
-                if self.job_id and 'job_id' in df.columns:
-                    df = df[df['job_id'] == self.job_id]
-                
-                # 基本统计
-                print("\n" + "="*50)
-                print("结果统计报告")
-                print("="*50)
-                print(f"总任务数: {len(df)}")
-                print(f"平均RMSE: {df['mean_rmse'].mean():.4f}")
-                print(f"最佳RMSE: {df['mean_rmse'].min():.4f}")
-                print(f"最差RMSE: {df['mean_rmse'].max():.4f}")
-                
-                # 按模型类型统计
-                if 'model_type' in df.columns:
-                    print("\n按模型类型统计:")
-                    model_stats = df.groupby('model_type').agg({
-                        'mean_rmse': ['mean', 'min', 'count']
-                    }).round(4)
-                    print(model_stats)
-                
-                # 找出最佳模型
-                if not df.empty:
-                    best_idx = df['mean_rmse'].idxmin()
-                    best_result = df.loc[best_idx]
-                    print(f"\n最佳模型:")
-                    print(f"  任务ID: {best_result['task_id']}")
-                    print(f"  模型类型: {best_result['model_type']}")
-                    print(f"  RMSE: {best_result['mean_rmse']:.4f}")
-                    print(f"  超参数: {best_result['hyperparameters']}")
-                
-        except Exception as e:
-            print(f"生成统计报告失败: {e}")

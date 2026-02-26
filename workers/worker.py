@@ -2,37 +2,66 @@ import time
 import json
 import signal
 import sys
-import gc
-from typing import Dict, Any, Optional
-import numpy as np
-import pandas as pd
-from sklearn.model_selection import cross_validate, train_test_split
-from sklearn.linear_model import LinearRegression, Ridge
-from sklearn.tree import DecisionTreeRegressor
-from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
-from sklearn.metrics import mean_squared_error, r2_score
+from typing import Dict, Any, Optional, Callable
 import psutil
 import os
+import importlib
 
 from utils.redis_client import RedisClient
-from config.settings import MODEL_CONFIG, DATA_DIR
+
+
+def _load_executor() -> Callable[[Dict[str, Any]], Dict[str, Any]]:
+    """根据环境变量动态加载任务执行函数。
+
+    默认从 workers.executor:execute_task 加载，
+    使用者可以通过设置环境变量 MLDS_EXECUTOR 来替换，
+    例如：
+
+    MLDS_EXECUTOR="my_project.executor:execute_task"
+    """
+
+    target = os.getenv("MLDS_EXECUTOR", "workers.executor:execute_task")
+    if ":" not in target:
+        raise RuntimeError(
+            f"无效的 MLDS_EXECUTOR 配置: {target}，应为 'module:func' 形式"
+        )
+
+    module_name, func_name = target.split(":", 1)
+    module = importlib.import_module(module_name)
+    func = getattr(module, func_name, None)
+    if func is None:
+        raise RuntimeError(
+            f"在模块 {module_name} 中未找到函数 {func_name}，"
+            f"请确认自定义执行器实现无误。"
+        )
+    return func
+
 
 class MLWorker:
-    """机器学习工作节点（内存优化版）"""
-    
+    """通用任务工作节点。
+
+    该类不再内置具体的机器学习训练逻辑，而是通过可插拔的
+    执行器函数来完成实际计算。调度系统只负责：
+    - 从 Redis 拉取任务
+    - 调用执行器得到结果
+    - 包装通用元数据（task_id/job_id/worker_id/memory 等）并推送结果队列
+    """
+
     def __init__(self, worker_id: str = None):
         self.worker_id = worker_id or f"worker_{os.getpid()}_{int(time.time())}"
         self.redis_client = RedisClient()
-        self.data = None  # 延迟加载数据
         self.is_running = True
-        
+
+        # 加载任务执行器
+        self.executor = _load_executor()
+
         # 注册信号处理
         signal.signal(signal.SIGINT, self.signal_handler)
         signal.signal(signal.SIGTERM, self.signal_handler)
-        
+
         # 注册工作节点
         self.register_worker()
-        
+
         # 内存监控
         self.memory_limit_mb = 500  # 内存限制500MB
         self.last_gc_time = time.time()
@@ -64,76 +93,6 @@ class MLWorker:
         print(f"\n工作节点 {self.worker_id} 收到退出信号")
         self.is_running = False
     
-    def load_data(self):
-        """加载数据集（延迟加载，减少内存占用）"""
-        if self.data is None:
-            print("加载波士顿房价数据集...")
-
-            # 优先尝试使用 sklearn 内置数据集（旧版本可用）
-            X = None
-            y = None
-            feature_names = None
-            try:
-                from sklearn.datasets import load_boston  # 延迟导入，兼容新版本 sklearn
-                boston = load_boston()
-
-                X = pd.DataFrame(boston.data, columns=boston.feature_names)
-                y = pd.Series(boston.target, name='MEDV')
-                feature_names = boston.feature_names.tolist()
-            except Exception as e:
-                print(f"使用 sklearn.load_boston 失败，将尝试从本地 CSV 加载: {e}")
-                csv_path = DATA_DIR / 'boston_housing.csv'
-                if not csv_path.exists():
-                    raise RuntimeError(
-                        f"无法加载 Boston 数据集，请在 'data' 目录中放入 'boston_housing.csv' 文件。期待路径: {csv_path}"
-                    )
-
-                # 优先尝试普通带表头的 CSV，要求包含 MEDV 列
-                df = None
-                try:
-                    df = pd.read_csv(csv_path)
-                except Exception:
-                    df = None
-
-                if df is not None and 'MEDV' in df.columns:
-                    X = df.drop(columns=['MEDV'])
-                    y = df['MEDV']
-                    feature_names = X.columns.tolist()
-                else:
-                    # 兼容无表头、以空白分隔的原始 Boston 数据格式
-                    df_raw = pd.read_csv(csv_path, header=None, delim_whitespace=True)
-                    if df_raw.shape[1] != 14:
-                        raise RuntimeError(
-                            "无法识别本地 Boston 数据集格式：既没有 MEDV 列，也不是每行 14 列的原始数据。"
-                        )
-
-                    feature_names = [
-                        'CRIM', 'ZN', 'INDUS', 'CHAS', 'NOX', 'RM',
-                        'AGE', 'DIS', 'RAD', 'TAX', 'PTRATIO', 'B',
-                        'LSTAT', 'MEDV'
-                    ]
-                    df_raw.columns = feature_names
-                    X = df_raw.drop(columns=['MEDV'])
-                    y = df_raw['MEDV']
-
-            # 转换为 DataFrame/Series 后统一做内存优化
-            for col in X.columns:
-                if X[col].dtype == 'float64':
-                    X[col] = X[col].astype('float32')
-                elif X[col].dtype == 'int64':
-                    X[col] = X[col].astype('int32')
-
-            self.data = {
-                'X': X,
-                'y': y,
-                'feature_names': feature_names,
-                'target_name': 'MEDV'
-            }
-            
-            print(f"数据集加载完成: {X.shape[0]} 样本, {X.shape[1]} 特征")
-        
-        return self.data
-    
     def check_memory_usage(self) -> bool:
         """检查内存使用情况"""
         process = psutil.Process(os.getpid())
@@ -151,129 +110,43 @@ class MLWorker:
             return False
         
         return True
-    
-    def create_model(self, model_type: str, hyperparameters: Dict[str, Any]):
-        """创建模型实例"""
-        try:
-            if model_type == 'linear':
-                # sklearn>=1.2 中 LinearRegression 不再支持 normalize 参数，这里只保留 fit_intercept
-                fit_intercept = hyperparameters.get('fit_intercept', True)
-                model = LinearRegression(fit_intercept=fit_intercept)
-            elif model_type == 'ridge':
-                model = Ridge(alpha=hyperparameters.get('alpha', 1.0))
-            elif model_type == 'tree':
-                model = DecisionTreeRegressor(
-                    max_depth=hyperparameters.get('max_depth', None),
-                    min_samples_split=hyperparameters.get('min_samples_split', 2),
-                    min_samples_leaf=hyperparameters.get('min_samples_leaf', 1),
-                    random_state=MODEL_CONFIG['random_state']
-                )
-            elif model_type == 'forest':
-                model = RandomForestRegressor(
-                    n_estimators=hyperparameters.get('n_estimators', 100),
-                    max_depth=hyperparameters.get('max_depth', None),
-                    min_samples_split=hyperparameters.get('min_samples_split', 2),
-                    min_samples_leaf=hyperparameters.get('min_samples_leaf', 1),
-                    random_state=MODEL_CONFIG['random_state'],
-                    n_jobs=1  # 单线程，避免内存爆炸
-                )
-            elif model_type == 'gradient':
-                model = GradientBoostingRegressor(
-                    n_estimators=hyperparameters.get('n_estimators', 100),
-                    learning_rate=hyperparameters.get('learning_rate', 0.1),
-                    max_depth=hyperparameters.get('max_depth', 3),
-                    random_state=MODEL_CONFIG['random_state']
-                )
-            else:
-                raise ValueError(f"未知模型类型: {model_type}")
-            
-            return model
-        except Exception as e:
-            print(f"创建模型失败: {e}")
-            return None
-    
-    def train_and_evaluate(self, task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """训练和评估模型"""
+
+    def execute_task(self, task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """调用用户自定义执行器并包装通用结果。
+
+        执行器自身只关心 task 的业务含义，这里只负责：
+        - 做基础的内存检查
+        - 记录执行时间
+        - 为结果补充调度层面的元数据
+        """
+
         try:
             # 检查内存使用
             if not self.check_memory_usage():
                 return None
-            
-            # 加载数据
-            data = self.load_data()
-            X, y = data['X'], data['y']
-            
-            # 创建模型
-            model_type = task.get('model_type', 'tree')
-            hyperparameters = task.get('hyperparameters', {})
-            
-            model = self.create_model(model_type, hyperparameters)
-            if model is None:
-                return None
-            
-            # 使用交叉验证评估
-            start_time = time.time()
-            
-            # 使用少量数据快速评估（节省内存）
-            if len(X) > 1000:
-                X_sample, _, y_sample, _ = train_test_split(
-                    X, y, test_size=0.7, random_state=MODEL_CONFIG['random_state']
-                )
-            else:
-                X_sample, y_sample = X, y
-            
-            # 使用交叉验证一次性计算多种指标
-            cv_results = cross_validate(
-                model,
-                X_sample,
-                y_sample,
-                cv=min(MODEL_CONFIG['cv_folds'], len(X_sample)),
-                scoring={
-                    'neg_mse': 'neg_mean_squared_error',
-                    'neg_mae': 'neg_mean_absolute_error',
-                    'r2': 'r2',
-                },
-                n_jobs=1,  # 单线程避免内存问题
-                return_train_score=False,
-            )
 
-            mse_scores = -cv_results['test_neg_mse']
-            mae_scores = -cv_results['test_neg_mae']
-            r2_scores = cv_results['test_r2']
-            rmse_scores = np.sqrt(mse_scores)
-            
-            training_time = time.time() - start_time
-            
-            # 收集结果
-            result = {
+            start_time = time.time()
+            user_result = self.executor(task) or {}
+            elapsed = time.time() - start_time
+
+            if not isinstance(user_result, dict):
+                raise TypeError("执行器返回值必须是 dict，可被 JSON 序列化")
+
+            base = {
                 'task_id': task.get('task_id'),
                 'job_id': task.get('job_id'),
                 'worker_id': self.worker_id,
-                'model_type': model_type,
-                'hyperparameters': hyperparameters,
-                'metrics': {
-                    'mean_rmse': float(np.mean(rmse_scores)),
-                    'std_rmse': float(np.std(rmse_scores)),
-                    'mean_mse': float(np.mean(mse_scores)),
-                    'std_mse': float(np.std(mse_scores)),
-                    'mean_mae': float(np.mean(mae_scores)),
-                    'std_mae': float(np.std(mae_scores)),
-                    'mean_r2': float(np.mean(r2_scores)),
-                    'std_r2': float(np.std(r2_scores)),
-                    'training_time': training_time
-                },
+                'completed_at': time.time(),
                 'memory_usage_mb': psutil.Process().memory_info().rss / 1024 / 1024,
-                'completed_at': time.time()
+                'executor_elapsed': elapsed,
             }
-            
-            # 清理内存
-            del model, cv_results, mse_scores, mae_scores, r2_scores, rmse_scores
-            #gc.collect()
-            
-            return result
-            
+
+            # 用户结果优先，调度元数据补充其余键
+            merged = {**base, **user_result}
+            return merged
+
         except Exception as e:
-            print(f"训练失败: {e}")
+            print(f"任务执行失败: {e}")
             return None
     
     def run(self):
@@ -295,17 +168,16 @@ class MLWorker:
                     idle_rounds = 0
                     print(f"工作节点 {self.worker_id} 处理任务: {task.get('task_id')}")
                     
-                    # 训练和评估
-                    result = self.train_and_evaluate(task)
+                    # 执行任务
+                    result = self.execute_task(task)
                     
                     if result:
                         # 提交结果
                         if self.redis_client.push_result(result):
                             processed_count += 1
-                            print(f"工作节点 {self.worker_id} 完成任务: {result['task_id']}, "
-                                  f"RMSE: {result['metrics']['mean_rmse']:.4f}")
+                            print(f"工作节点 {self.worker_id} 完成任务: {result.get('task_id')}")
                         else:
-                            print(f"提交结果失败: {result['task_id']}")
+                            print(f"提交结果失败: {result.get('task_id')}")
                     else:
                         print(f"训练失败: {task.get('task_id')}")
                 else:
